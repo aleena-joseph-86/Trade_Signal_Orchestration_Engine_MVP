@@ -24,14 +24,14 @@ def read_root():
 
 class Signal(BaseModel):
     symbol: str = Field(..., example="MSFT")
-    percent: float = Field(..., example=10.0)
+    units: float = Field(..., example=10.0)
     action: Literal["BUY", "SELL"] = Field(..., example="BUY")
     id: Optional[str] = Field(None, example="123e4567-e89b-12d3-a456-426614174000")
     class Config:
         schema_extra = {
             "example": {
                 "symbol": "MSFT",
-                "percent": 10,
+                "units": 10,
                 "action": "BUY"
             }
         }
@@ -52,5 +52,5 @@ def place_trade(signal: Signal):
         "status": "Trade placed (mock)",
         "symbol": signal.symbol,
         "action": signal.action,
-        "percent": signal.percent
+        "units": signal.units
     }
