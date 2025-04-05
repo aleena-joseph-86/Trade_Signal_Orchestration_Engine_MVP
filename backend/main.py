@@ -42,12 +42,6 @@ def receive_signal(signal: Signal):
     signals.append(signal)
     return {"status": "received", "id": signal.id}
 
-@app.post("/webhook")
-def receive_signal(signal: Signal): 
-    signal.id = str(uuid.uuid4())  
-    signals.append(signal)
-    return {"status": "received", "id": signal.id}
-
 @app.get("/signals", response_model=List[Signal])
 def get_signals():
     return signals
