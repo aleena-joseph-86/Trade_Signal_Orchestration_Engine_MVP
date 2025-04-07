@@ -1,145 +1,180 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
+import { Button, Input, Modal, Table, message } from "antd";
+import type { ColumnsType } from "antd/es/table";
 import "./App.css";
 
 type Signal = {
   id: string;
   symbol: string;
-  percent: number;
+  units: number;
   action: string;
-  accepted?: boolean;
+  order_type: "MKT" | "LMT";
+  price?: number | null;
+  accepted: boolean;
 };
 
 function App() {
   const [signals, setSignals] = useState<Signal[]>([]);
-  const [editingSignalId, setEditingSignalId] = useState<string | null>(null);
-  const [editedSignal, setEditedSignal] = useState<Signal | null>(null);
-  const acceptedSignalsRef = useRef<Set<string>>(new Set());
+  const [editing, setEditing] = useState<Signal | null>(null);
+  const [confirming, setConfirming] = useState<Signal | null>(null);
+  const [loading, setLoading] = useState(false);
 
   const fetchSignals = () => {
     fetch("http://localhost:8000/signals")
       .then((res) => res.json())
-      .then((data) => {
-        // Preserve local accepted state
-        const updated = data.map((signal: Signal) => ({
-          ...signal,
-          accepted: acceptedSignalsRef.current.has(signal.id),
-        }));
-        setSignals(updated);
-      })
+      .then(setSignals)
       .catch(console.error);
   };
 
   useEffect(() => {
-    const interval = setInterval(fetchSignals, 3000);
     fetchSignals();
+    const interval = setInterval(fetchSignals, 3000);
     return () => clearInterval(interval);
   }, []);
 
-  const handleAccept = (signal: Signal) => {
-    fetch("http://localhost:8000/trade", {
+  const confirmAccept = (signal: Signal) => {
+    setConfirming(signal); // open confirmation modal
+  };
+
+  const handleConfirmedAccept = async () => {
+    if (!confirming) return;
+
+    try {
+      // First: mark as accepted
+      await fetch("http://localhost:8000/trade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(confirming),
+      });
+
+      // Second: place the order (just logs to console)
+      await fetch("http://localhost:8000/place-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(confirming),
+      });
+
+      message.success("Trade accepted and order placed!");
+    } catch (error) {
+      message.error("Error placing order");
+      console.error(error);
+    } finally {
+      setConfirming(null);
+      fetchSignals();
+    }
+  };
+
+  const handleReject = (signal: Signal) => {
+    fetch("http://localhost:8000/reject", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(signal),
     })
       .then((res) => res.json())
-      .then((data) => {
-        console.log("Trade accepted:", data);
-        acceptedSignalsRef.current.add(signal.id);
-        setSignals((prev) =>
-          prev.map((s) => (s.id === signal.id ? { ...s, accepted: true } : s))
-        );
+      .then(() => {
+        message.warning("Trade rejected!");
+        fetchSignals();
       });
   };
 
-  const handleEdit = (signal: Signal) => {
-    setEditingSignalId(signal.id);
-    setEditedSignal({ ...signal });
+  const handleEditSave = () => {
+    if (!editing) return;
+    setLoading(true);
+    fetch(`http://localhost:8000/update/${editing.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ units: editing.units }),
+    })
+      .then((res) => res.json())
+      .then(() => {
+        message.success("Units updated");
+        setEditing(null);
+        fetchSignals();
+      })
+      .finally(() => setLoading(false));
   };
+  
 
-  const handleChange = (
-    e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
-  ) => {
-    const { name, value } = e.target;
-    if (editedSignal) {
-      setEditedSignal({
-        ...editedSignal,
-        [name]: name === "percent" ? Number(value) : value,
-      });
-    }
-  };
-
-  const handleSave = () => {
-    if (!editedSignal) return;
-    setSignals((prev) =>
-      prev.map((s) => (s.id === editedSignal.id ? editedSignal : s))
-    );
-    setEditingSignalId(null);
-    setEditedSignal(null);
-  };
-
-  const handleCancel = () => {
-    setEditingSignalId(null);
-    setEditedSignal(null);
-  };
+  const columns: ColumnsType<Signal> = [
+    { title: "Symbol", dataIndex: "symbol" },
+    { title: "Action", dataIndex: "action" },
+    { title: "Order Type", dataIndex: "order_type" },
+    {
+      title: "Price",
+      dataIndex: "price",
+      render: (value) => (value !== null ? value : "—"),
+    },
+    { title: "Units", dataIndex: "units" },
+    {
+      title: "Status",
+      render: (_, record) =>
+        record.accepted ? (
+          <span className="text-green-600 font-semibold">Accepted</span>
+        ) : record.rejected ? (
+          <span className="text-red-500 font-semibold">Rejected</span>
+        ) : (
+          <span className="text-yellow-500">Pending</span>
+        ),
+    },
+    {
+      title: "Actions",
+      render: (_, signal) => (
+        <div className="flex gap-2">
+          {!signal.accepted && !signal.rejected && (
+            <>
+              <Button onClick={() => confirmAccept(signal)} type="primary">
+                Accept
+              </Button>
+              <Button danger onClick={() => handleReject(signal)}>
+                Reject
+              </Button>
+              <Button onClick={() => setEditing(signal)}>Edit</Button>
+            </>
+          )}
+        </div>
+      ),
+    },
+  ];
 
   return (
-    <div className="container">
-      <h1>Trading Signals</h1>
+    <div className="p-6 max-w-5xl mx-auto">
+      <h1 className="text-3xl font-bold mb-4">Trading Signals</h1>
+      <Table dataSource={signals} columns={columns} rowKey="id" />
 
-      {signals.length === 0 && <p>No trading signals yet.</p>}
+      {/* Modal to edit units */}
+      <Modal
+        open={!!editing}
+        onCancel={() => setEditing(null)}
+        onOk={handleEditSave}
+        confirmLoading={loading}
+        title="Edit Units"
+      >
+        <div className="space-y-4">
+          <Input
+            addonBefore="Units"
+            type="number"
+            value={editing?.units}
+            onChange={(e) =>
+              setEditing((prev) => prev && { ...prev, units: +e.target.value })
+            }
+          />
+        </div>
+      </Modal>
 
-      {signals.map((signal) =>
-        editingSignalId === signal.id && editedSignal ? (
-          <div key={signal.id} className="signal-card">
-            <input
-              name="symbol"
-              value={editedSignal.symbol}
-              onChange={handleChange}
-            />
-            <input
-              name="percent"
-              type="number"
-              value={editedSignal.percent}
-              onChange={handleChange}
-            />
-            <select
-              name="action"
-              value={editedSignal.action}
-              onChange={handleChange}
-            >
-              <option value="BUY">BUY</option>
-              <option value="SELL">SELL</option>
-            </select>
-            <div>
-              <button onClick={handleSave} className="accept">
-                Save
-              </button>
-              <button onClick={handleCancel}>Cancel</button>
-            </div>
-          </div>
-        ) : (
-          <div key={signal.id} className="signal-card">
-            <p>
-              <strong>{signal.action}</strong> {signal.percent}% of AUM in{" "}
-              <strong>{signal.symbol}</strong>
-            </p>
-            <div>
-              {signal.accepted ? (
-                <button disabled className="accepted">
-                  Accepted
-                </button>
-              ) : (
-                <button onClick={() => handleAccept(signal)} className="accept">
-                  Accept
-                </button>
-              )}
-              <button onClick={() => handleEdit(signal)} className="edit">
-                Edit
-              </button>
-            </div>
-          </div>
-        )
-      )}
+      {/* Confirmation modal for placing order */}
+      <Modal
+        open={!!confirming}
+        onCancel={() => setConfirming(null)}
+        onOk={handleConfirmedAccept}
+        okText="Yes, Place Order"
+        cancelText="No"
+        title="Confirm Order"
+      >
+        <p>
+          Are you sure you want to place a <strong>{confirming?.action}</strong> order for{" "}
+          <strong>{confirming?.units}</strong> units of <strong>{confirming?.symbol}</strong>?
+        </p>
+      </Modal>
     </div>
   );
 }
