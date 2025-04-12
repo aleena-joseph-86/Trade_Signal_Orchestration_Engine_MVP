@@ -3,25 +3,31 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, Trade
+from fastapi.encoders import jsonable_encoder
 import uuid
+import threading
+import asyncio
 
 # --- FastAPI App Initialization ---
 app = FastAPI()
+ib = IB()
 
-# --- CORS Configuration ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for dev; restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- MongoDB Connection ---
+# --- MongoDB ---
 MONGO_URI = "mongodb://localhost:27017"
 client = AsyncIOMotorClient(MONGO_URI)
 db = client.trading
 signals_collection = db.signals
+executions_collection = db.executions
 
 # --- Pydantic Models ---
 class Signal(BaseModel):
@@ -31,56 +37,61 @@ class Signal(BaseModel):
     action: Literal["BUY", "SELL"]
     order_type: Literal["MKT", "LMT"]
     price: Optional[float] = None
+    exchange: str = 'SMART'
+    currency: str = 'USD'
     accepted: bool = False
     rejected: bool = False
+    status: Optional[str] = '-'
 
     @model_validator(mode="after")
     def check_price_for_lmt(self):
         if self.order_type == "LMT" and self.price is None:
             raise ValueError("Price is required for LMT orders.")
         if self.order_type == "MKT":
-            self.price = None  # Ensure price is null for MKT
+            self.price = None
         return self
 
 class UpdateUnits(BaseModel):
     units: float
 
-# --- Routes ---
+# --- IB Connection ---
+def connect_ib():
+    print("🔌 Connecting to IB...")
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        ib.connect("127.0.0.1", 7497, clientId=1)
+        ib.run()
+    except Exception as e:
+        print(f"Connection failed: {e}")
+    else:
+        print("✅ Connected to IB")
+
+
+@app.on_event("startup")
+def startup_event():
+    print("🚀 Starting up...")
+    thread = threading.Thread(target=connect_ib, daemon=True)
+    thread.start()
 
 @app.get("/")
 def root():
-    return {"message": "Trading Signal API is live. Visit /docs for Swagger."}
+    return {"message": "FastAPI + IBKR Running"}
 
-
+# --- CRUD APIs ---
 @app.post("/webhook")
 async def receive_signal(signal: Signal):
-    existing = await signals_collection.find_one({"id": signal.id})
-    if existing:
+    if await signals_collection.find_one({"id": signal.id}):
         raise HTTPException(status_code=400, detail="Signal already exists.")
-    await signals_collection.insert_one(signal.dict())
+    await signals_collection.insert_one(signal.model_dump())
     return {"status": "received", "id": signal.id}
-
 
 @app.get("/signals", response_model=List[Signal])
 async def get_signals():
-    raw_signals = await signals_collection.find().to_list(length=100)
-    cleaned_signals = []
-
-    for doc in raw_signals:
-        doc.pop("_id", None)
-
-        # Fill missing fields
-        doc.setdefault("order_type", "MKT")
-        doc.setdefault("price", None)
-        doc.setdefault("accepted", False)
-        doc.setdefault("rejected", False)
-
-        try:
-            cleaned_signals.append(Signal(**doc))
-        except Exception as e:
-            print(f"Skipping invalid signal due to: {e}")
-
-    return cleaned_signals
+    raw = await signals_collection.find().to_list(100)
+    for r in raw:
+        r.pop("_id", None)
+    return [Signal(**r) for r in raw]
 
 
 @app.post("/trade")
@@ -91,8 +102,7 @@ async def accept_signal(signal: Signal):
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Signal not found.")
-    return {"status": "accepted", "id": signal.id}
-
+    return {"status": "accepted"}
 
 @app.post("/reject")
 async def reject_signal(signal: Signal):
@@ -102,8 +112,7 @@ async def reject_signal(signal: Signal):
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Signal not found.")
-    return {"status": "rejected", "id": signal.id}
-
+    return {"status": "rejected"}
 
 @app.put("/update/{signal_id}")
 async def update_units(signal_id: str, update: UpdateUnits):
@@ -114,16 +123,66 @@ async def update_units(signal_id: str, update: UpdateUnits):
     if result.matched_count == 0:
         raise HTTPException(
             status_code=400,
-            detail="Cannot update. Signal either not found or already accepted/rejected.",
+            detail="Signal not found or already acted on."
         )
-    return {"status": "updated", "units": update.units}
+    return {"status": "updated"}
 
-
+# --- Place Order + Track Execution ---
 @app.post("/place-order")
-async def place_order(signal: Signal):
-    print(f"Placing final order for: {signal.symbol}, units: {signal.units}, action: {signal.action}")
+async def place_order(order: Signal):
+    if not ib.isConnected():
+        raise HTTPException(status_code=500, detail="IBKR not connected.")
+
+    contract = Stock(order.symbol, exchange=order.exchange, currency=order.currency)
+    details = await ib.reqContractDetailsAsync(contract)
+    if not details:
+        raise HTTPException(status_code=404, detail="Symbol not found.")
+
+    qualified_contract = details[0].contract
+
+    # Create IB Order
+    if order.order_type == "MKT":
+        ib_order = MarketOrder(order.action, order.units)
+    elif order.order_type == "LMT":
+        ib_order = LimitOrder(order.action, order.units, order.price)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid order type.")
+
+    # Place Order
+    trade: Trade = ib.placeOrder(qualified_contract, ib_order)
+
+    # Wait until order is filled or cancelled
+    while not trade.isDone():
+        await asyncio.sleep(1)
+
+    execution_data = {
+        "symbol": order.symbol,
+        "permId": trade.order.permId,
+        "action": order.action,
+        "filled": trade.orderStatus.filled,
+        "avgFillPrice": trade.orderStatus.avgFillPrice,
+        "status": trade.orderStatus.status,
+        "timestamp": str(trade.log[-1].time) if trade.log else None
+    }
+
+    # Insert execution data into the executions collection
+    await executions_collection.insert_one(execution_data)
+
+    # Update the signal document with permId and status fields
+    # After the order is executed, update the signal with the permId and status
+    result = await signals_collection.update_one(
+        {"id": order.id},
+        {"$set": {
+            "permId": trade.order.permId,
+            "status": trade.orderStatus.status  # <-- add this line
+        }}
+)
+
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Signal not found.")
+
     return {
-        "status": "Order placed",
-        "symbol": signal.symbol,
-        "units": signal.units
+        "status": "order executed",
+        "execution": jsonable_encoder(execution_data)
     }

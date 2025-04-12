@@ -11,6 +11,8 @@ type Signal = {
   order_type: "MKT" | "LMT";
   price?: number | null;
   accepted: boolean;
+  rejected: boolean;
+  status?: string;
 };
 
 function App() {
@@ -28,12 +30,12 @@ function App() {
 
   useEffect(() => {
     fetchSignals();
-    const interval = setInterval(fetchSignals, 3000);
+    const interval = setInterval(fetchSignals, 3000); // Refresh every 3 seconds
     return () => clearInterval(interval);
   }, []);
 
   const confirmAccept = (signal: Signal) => {
-    setConfirming(signal); // open confirmation modal
+    setConfirming(signal);
   };
 
   const handleConfirmedAccept = async () => {
@@ -70,11 +72,11 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(signal),
     })
-      .then((res) => res.json())
       .then(() => {
         message.warning("Trade rejected!");
         fetchSignals();
-      });
+      })
+      .catch(console.error);
   };
 
   const handleEditSave = () => {
@@ -85,7 +87,6 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ units: editing.units }),
     })
-      .then((res) => res.json())
       .then(() => {
         message.success("Units updated");
         setEditing(null);
@@ -93,7 +94,6 @@ function App() {
       })
       .finally(() => setLoading(false));
   };
-  
 
   const columns: ColumnsType<Signal> = [
     { title: "Symbol", dataIndex: "symbol" },
@@ -102,37 +102,61 @@ function App() {
     {
       title: "Price",
       dataIndex: "price",
-      render: (value) => (value !== null ? value : "—"),
+      render: (value) => (value !== null && value !== undefined ? value : "—"),
     },
     { title: "Units", dataIndex: "units" },
     {
-      title: "Status",
+      title: "Signal Status",
       render: (_, record) =>
         record.accepted ? (
-          <span className="text-green-600 font-semibold">Accepted</span>
+          <span style={{ color: "green", fontWeight: 600 }}>Accepted</span>
         ) : record.rejected ? (
-          <span className="text-red-500 font-semibold">Rejected</span>
+          <span style={{ color: "red", fontWeight: 600 }}>Rejected</span>
         ) : (
-          <span className="text-yellow-500">Pending</span>
+          <span style={{ color: "orange" }}>Pending</span>
         ),
     },
     {
+      title: "Execution Status",
+      dataIndex: "status",
+      key: "executionStatus",
+      render: (status) => {
+        let color = "";
+        switch (status) {
+          case "Filled":
+            color = "green";
+            break;
+          case "Failed":
+            color = "red";
+            break;
+          case "Pending":
+            color = "orange";
+            break;
+          default:
+            color = "gray";
+        }
+
+        return (
+          <span style={{ fontWeight: "700", color }}>
+            {status || "—"}
+          </span>
+        );
+      },
+    },
+    {
       title: "Actions",
-      render: (_, signal) => (
-        <div className="flex gap-2">
-          {!signal.accepted && !signal.rejected && (
-            <>
-              <Button onClick={() => confirmAccept(signal)} type="primary">
-                Accept
-              </Button>
-              <Button danger onClick={() => handleReject(signal)}>
-                Reject
-              </Button>
-              <Button onClick={() => setEditing(signal)}>Edit</Button>
-            </>
-          )}
-        </div>
-      ),
+      render: (_, signal) =>
+        !signal.accepted && !signal.rejected ? (
+          <div className="flex gap-2">
+            <Button onClick={() => confirmAccept(signal)} type="primary">
+              Accept
+            </Button>
+            <Button danger onClick={() => handleReject(signal)}>
+              Reject
+            </Button>
+            <Button onClick={() => setEditing(signal)}>Edit</Button>
+          </div>
+        ) : null,
     },
   ];
 
@@ -141,8 +165,8 @@ function App() {
       <h1 className="text-3xl font-bold mb-4">Trading Signals</h1>
       <Table dataSource={signals} columns={columns} rowKey="id" />
 
-      {/* Modal to edit units */}
-      <Modal
+    {/* Modal to edit units */}
+    <Modal
         open={!!editing}
         onCancel={() => setEditing(null)}
         onOk={handleEditSave}
