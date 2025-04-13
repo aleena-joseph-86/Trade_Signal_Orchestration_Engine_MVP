@@ -5,6 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi.middleware.cors import CORSMiddleware
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, Trade
 from fastapi.encoders import jsonable_encoder
+from fastapi import BackgroundTasks
 import uuid
 import threading
 import asyncio
@@ -136,7 +137,6 @@ async def place_order(order: Signal):
 
     # Define contract
     contract = Stock(order.symbol, exchange=order.exchange, currency=order.currency)
-
     details = await ib.reqContractDetailsAsync(contract)
     if not details:
         raise HTTPException(status_code=404, detail="Symbol not found.")
@@ -154,35 +154,34 @@ async def place_order(order: Signal):
     # Place the order
     trade: Trade = ib.placeOrder(qualified_contract, ib_order)
 
-    # --- Wait for permId and status ---
+    # --- Wait for permId and initial status ---
     retries = 0
     while (not trade.order.permId or trade.order.permId == 0 or not trade.orderStatus.status) and retries < 20:
         await asyncio.sleep(0.5)
         retries += 1
 
-    # For market orders, optionally wait for execution completion
+    # Wait for MKT execution if necessary
     if order.order_type == "MKT":
         while not trade.isDone():
             await asyncio.sleep(0.5)
 
-    # Prepare execution data
+    # Save initial execution snapshot
     execution_data = {
-    "SignalId": order.id,
-    "orderId": trade.order.orderId,
-    "symbol": order.symbol,
-    "units": order.units,
-    "orderType": order.order_type,
-    "permId": trade.order.permId,
-    "action": order.action,
-    "filled": trade.orderStatus.filled,
-    "avgFillPrice": trade.orderStatus.avgFillPrice,
-    "status": trade.orderStatus.status,
-    "timestamp": str(trade.log[-1].time) if trade.log else None
-}
-    # Store in executions collection
+        "SignalId": order.id,
+        "orderId": trade.order.orderId,
+        "symbol": order.symbol,
+        "units": order.units,
+        "orderType": order.order_type,
+        "action": order.action,
+        "permId": trade.order.permId,
+        "filled": trade.orderStatus.filled,
+        "avgFillPrice": trade.orderStatus.avgFillPrice,
+        "status": trade.orderStatus.status,
+        "timestamp": str(trade.log[-1].time) if trade.log else None
+    }
     await executions_collection.insert_one(execution_data)
 
-    # Update signal
+    # Update signal with permId + status
     result = await signals_collection.update_one(
         {"id": order.id},
         {"$set": {
@@ -193,6 +192,45 @@ async def place_order(order: Signal):
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Signal not found for update.")
+
+    # ✅ Real-time updates: attach handler
+
+    loop = asyncio.get_running_loop()  # Get main loop once
+
+    def handle_order_status(trade: Trade):
+        async def update_status():
+            latest_status = trade.orderStatus.status
+            permId = trade.order.permId
+            filled = trade.orderStatus.filled
+            avgFillPrice = trade.orderStatus.avgFillPrice
+            signal_id = order.id
+
+            update_fields = {
+                "status": latest_status,
+                "filled": filled,
+                "avgFillPrice": avgFillPrice,
+                "timestamp": str(trade.log[-1].time) if trade.log else None,
+            }
+
+            # Update signal
+            result_signal = await signals_collection.update_one(
+                {"id": signal_id},
+                {"$set": update_fields}
+            )
+            print(f"[Update] signals_collection: {result_signal.modified_count} updated")
+
+            # Update executions
+            result_exec = await executions_collection.update_one(
+                {"SignalId": signal_id},
+                {"$set": update_fields}
+            )
+            print(f"[Update] executions_collection: {result_exec.modified_count} updated")
+
+        # Schedule it properly
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(update_status()))
+
+    trade.filledEvent += handle_order_status
+    trade.statusEvent += handle_order_status
 
     return {
         "status": "order placed",
