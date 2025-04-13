@@ -114,6 +114,8 @@ async def reject_signal(signal: Signal):
         raise HTTPException(status_code=404, detail="Signal not found.")
     return {"status": "rejected"}
 
+
+
 @app.put("/update/{signal_id}")
 async def update_units(signal_id: str, update: UpdateUnits):
     result = await signals_collection.update_one(
@@ -127,20 +129,21 @@ async def update_units(signal_id: str, update: UpdateUnits):
         )
     return {"status": "updated"}
 
-# --- Place Order + Track Execution ---
 @app.post("/place-order")
 async def place_order(order: Signal):
     if not ib.isConnected():
         raise HTTPException(status_code=500, detail="IBKR not connected.")
 
+    # Define contract
     contract = Stock(order.symbol, exchange=order.exchange, currency=order.currency)
+
     details = await ib.reqContractDetailsAsync(contract)
     if not details:
         raise HTTPException(status_code=404, detail="Symbol not found.")
 
     qualified_contract = details[0].contract
 
-    # Create IB Order
+    # Create order
     if order.order_type == "MKT":
         ib_order = MarketOrder(order.action, order.units)
     elif order.order_type == "LMT":
@@ -148,17 +151,27 @@ async def place_order(order: Signal):
     else:
         raise HTTPException(status_code=400, detail="Invalid order type.")
 
-    # Place Order
+    # Place the order
     trade: Trade = ib.placeOrder(qualified_contract, ib_order)
 
-    # Don't wait for isDone() for limit orders
+    # --- Wait for permId and status ---
+    retries = 0
+    while (not trade.order.permId or trade.order.permId == 0 or not trade.orderStatus.status) and retries < 20:
+        await asyncio.sleep(0.5)
+        retries += 1
+
+    # For market orders, optionally wait for execution completion
     if order.order_type == "MKT":
         while not trade.isDone():
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
-
+    # Prepare execution data
     execution_data = {
+    "SignalId": order.id,
+    "orderId": trade.order.orderId,
     "symbol": order.symbol,
+    "units": order.units,
+    "orderType": order.order_type,
     "permId": trade.order.permId,
     "action": order.action,
     "filled": trade.orderStatus.filled,
@@ -166,25 +179,22 @@ async def place_order(order: Signal):
     "status": trade.orderStatus.status,
     "timestamp": str(trade.log[-1].time) if trade.log else None
 }
-
-    # Insert execution data into the executions collection
+    # Store in executions collection
     await executions_collection.insert_one(execution_data)
 
-    # Update the signal document with permId and status fields
-    # After the order is executed, update the signal with the permId and status
+    # Update signal
     result = await signals_collection.update_one(
         {"id": order.id},
         {"$set": {
             "permId": trade.order.permId,
-            "status": trade.orderStatus.status  # <-- add this line
+            "status": trade.orderStatus.status
         }}
-)
+    )
 
-    
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Signal not found.")
+        raise HTTPException(status_code=404, detail="Signal not found for update.")
 
     return {
-        "status": "order executed",
+        "status": "order placed",
         "execution": jsonable_encoder(execution_data)
     }
