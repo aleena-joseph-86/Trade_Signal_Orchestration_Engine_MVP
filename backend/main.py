@@ -151,19 +151,21 @@ async def place_order(order: Signal):
     # Place Order
     trade: Trade = ib.placeOrder(qualified_contract, ib_order)
 
-    # Wait until order is filled or cancelled
-    while not trade.isDone():
-        await asyncio.sleep(1)
+    # Don't wait for isDone() for limit orders
+    if order.order_type == "MKT":
+        while not trade.isDone():
+            await asyncio.sleep(1)
+
 
     execution_data = {
-        "symbol": order.symbol,
-        "permId": trade.order.permId,
-        "action": order.action,
-        "filled": trade.orderStatus.filled,
-        "avgFillPrice": trade.orderStatus.avgFillPrice,
-        "status": trade.orderStatus.status,
-        "timestamp": str(trade.log[-1].time) if trade.log else None
-    }
+    "symbol": order.symbol,
+    "permId": trade.order.permId,
+    "action": order.action,
+    "filled": trade.orderStatus.filled,
+    "avgFillPrice": trade.orderStatus.avgFillPrice,
+    "status": trade.orderStatus.status,
+    "timestamp": str(trade.log[-1].time) if trade.log else None
+}
 
     # Insert execution data into the executions collection
     await executions_collection.insert_one(execution_data)

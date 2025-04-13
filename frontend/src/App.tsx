@@ -95,6 +95,30 @@ function App() {
       .finally(() => setLoading(false));
   };
 
+  const handlePlaceOrder = async (signal: Signal) => {
+    try {
+      const res = await fetch("http://localhost:8000/place-order", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(signal),
+      });
+  
+      const data = await res.json();
+  
+      if (res.ok) {
+        message.success("Order placed successfully!");
+        setConfirming(null);  // <-- This closes the modal
+        fetchSignals();       // Refresh signals
+      } else {
+        message.error(data.detail || "Order placement failed.");
+      }
+    } catch (err) {
+      console.error(err);
+      message.error("Error placing order.");
+    }
+  };
+  
+
   const columns: ColumnsType<Signal> = [
     { title: "Symbol", dataIndex: "symbol" },
     { title: "Action", dataIndex: "action" },

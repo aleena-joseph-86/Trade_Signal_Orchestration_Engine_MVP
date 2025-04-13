@@ -31,5 +31,6 @@ ib.sleep(3)
 print(f"Order status: {trade.orderStatus.status}")
 print(f"Filled: {trade.orderStatus.filled}")
 print(f"Order ID: {trade.order.orderId}")
+print(f"Permanent ID: {trade.order.permId}")
 
 get_order_details(trade.order.orderId)
